@@ -7,7 +7,6 @@ from pathlib import Path
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
-from PIL import Image
 
 
 # -------------------- App Config --------------------
@@ -21,7 +20,7 @@ ASSETS_DIR = BASE_DIR / "assets"
 EXPORTS_DIR = BASE_DIR / "exports"
 EXPORTS_DIR.mkdir(exist_ok=True)
 
-LOGO_PATH = ASSETS_DIR / "logo.png"  # opsionale
+LOGO_PATH = ASSETS_DIR / "logo.png"  # optional
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="centered")
 
@@ -57,6 +56,14 @@ CITY_DB = {
     "Fier": (40.7239, 19.5561),
 }
 
+LOSS_PRESETS = {
+    "Residential (standard)": 14,
+    "Commercial (good design)": 12,
+    "Industrial (high performance)": 10,
+    "Shading / riskier site": 18,
+    "Custom": None,
+}
+
 
 @st.cache_data(show_spinner=False, ttl=60 * 60)  # 1 hour cache
 def pvgis_monthly(lat, lon, peakpower, loss, tilt, azimuth):
@@ -76,12 +83,6 @@ def pvgis_monthly(lat, lon, peakpower, loss, tilt, azimuth):
 
 
 def extract_monthly_table(pvgis_json: dict) -> pd.DataFrame:
-    """
-    PVGIS outputs['monthly'] sometimes is:
-      - list of dicts (most common)
-      - or dict containing 'fixed' / other keys
-    We handle both.
-    """
     outputs = pvgis_json.get("outputs", {})
     monthly = outputs.get("monthly")
 
@@ -91,23 +92,20 @@ def extract_monthly_table(pvgis_json: dict) -> pd.DataFrame:
     if isinstance(monthly, list):
         df = pd.DataFrame(monthly)
     elif isinstance(monthly, dict):
-        # try common keys
         if "fixed" in monthly:
             df = pd.DataFrame(monthly["fixed"])
         else:
-            # fallback: first list-like value inside dict
             list_candidate = None
             for v in monthly.values():
                 if isinstance(v, list):
                     list_candidate = v
                     break
             if list_candidate is None:
-                raise ValueError(f"PVGIS outputs.monthly has unexpected format: keys={list(monthly.keys())}")
+                raise ValueError(f"PVGIS outputs.monthly unexpected: keys={list(monthly.keys())}")
             df = pd.DataFrame(list_candidate)
     else:
         raise ValueError(f"PVGIS outputs.monthly type unexpected: {type(monthly)}")
 
-    # Expect E_m (kWh) and month
     if "month" not in df.columns:
         raise ValueError(f"PVGIS monthly table missing 'month'. Columns: {list(df.columns)}")
     if "E_m" not in df.columns:
@@ -120,9 +118,9 @@ def extract_monthly_table(pvgis_json: dict) -> pd.DataFrame:
 
 def compute_financials(annual_kwh, price_per_kwh, capex, opex_percent, lifetime_years, degradation_percent):
     """
-    Model i thjeshtë:
-    - energjia bie çdo vit me degradation_percent
-    - savings = energy * price
+    Simple model:
+    - energy degrades each year
+    - savings = energy * price_per_kwh
     - opex = capex * opex_percent
     """
     annual_kwh = float(annual_kwh)
@@ -144,7 +142,7 @@ def compute_financials(annual_kwh, price_per_kwh, capex, opex_percent, lifetime_
             "GrossSavings_EUR": gross,
             "OPEX_EUR": opex,
             "NetCashflow_EUR": net,
-            "Cumulative_EUR": cumulative
+            "Cumulative_EUR": cumulative,
         })
 
     df = pd.DataFrame(rows)
@@ -166,7 +164,7 @@ def make_pdf_report(params: dict, df_monthly: pd.DataFrame, summary: dict, df_ca
     y = height - 50
 
     if LOGO_PATH.exists():
-        c.drawImage(str(LOGO_PATH), 50, y - 35, width=80, height=30, mask='auto')
+        c.drawImage(str(LOGO_PATH), 50, y - 35, width=80, height=30, mask="auto")
         c.setFont("Helvetica-Bold", 18)
         c.drawString(140, y - 10, f"{APP_NAME} — Report")
     else:
@@ -189,7 +187,8 @@ def make_pdf_report(params: dict, df_monthly: pd.DataFrame, summary: dict, df_ca
         f"City: {params['city']} | Location (lat, lon): {params['lat']:.6f}, {params['lon']:.6f}",
         f"System size: {params['peakpower']:.2f} kWp | Losses: {params['loss']}%",
         f"Tilt: {params['tilt']}° | Azimuth: {params['azimuth']}°",
-        f"Energy price: €{params['price_per_kwh']:.2f}/kWh | CAPEX: €{params['capex']:.0f} | OPEX: {params['opex_percent']:.1f}%/yr",
+        f"Energy price: €{params['price_per_kwh']:.2f}/kWh | Export: €{params['export_price']:.2f}/kWh | Self-consumption: {params['self_consumption']:.0f}%",
+        f"CAPEX: €{params['capex']:.0f} | OPEX: {params['opex_percent']:.1f}%/yr",
         f"Lifetime: {params['lifetime_years']} yrs | Degradation: {params['degradation_percent']:.2f}%/yr",
     ]
     for line in input_lines:
@@ -208,6 +207,8 @@ def make_pdf_report(params: dict, df_monthly: pd.DataFrame, summary: dict, df_ca
     result_lines = [
         f"Annual energy: {summary['annual_kwh']:.0f} kWh/year",
         f"Specific yield: {summary['specific_yield']:.0f} kWh/kWp/year",
+        f"Gross savings (Year 1): €{summary['gross_savings_y1']:.0f}/year",
+        f"OPEX (Year 1): €{summary['opex_y1']:.0f}/year",
         f"Net savings (Year 1): €{summary['net_savings_y1']:.0f}/year",
         f"Simple payback (year): {payback_txt}",
         f"ROI over lifetime: {roi_txt}",
@@ -220,6 +221,7 @@ def make_pdf_report(params: dict, df_monthly: pd.DataFrame, summary: dict, df_ca
     c.setFont("Helvetica-Bold", 12)
     c.drawString(50, y, "Monthly energy (kWh)")
     y -= 16
+
     c.setFont("Helvetica-Bold", 10)
     c.drawString(50, y, "Month")
     c.drawString(120, y, "Energy (kWh)")
@@ -272,24 +274,60 @@ city = st.selectbox("City (auto lat/lon)", list(CITY_DB.keys()), index=0)
 default_lat, default_lon = CITY_DB[city]
 
 col1, col2 = st.columns(2)
+
 with col1:
     lat = st.number_input("Latitude", value=float(default_lat), format="%.6f")
-    peakpower = st.number_input("System size (kWp)", value=5.0, min_value=0.1, step=0.1)
-    loss = st.slider("Total losses (%)", 0, 30, 14)
+    peakpower_manual = st.number_input("System size (kWp)", value=5.0, min_value=0.1, step=0.1)
 
 with col2:
     lon = st.number_input("Longitude", value=float(default_lon), format="%.6f")
     tilt = st.slider("Tilt (deg)", 0, 90, 30)
     azimuth = st.slider("Azimuth (deg): 0=S, -90=E, +90=W", -180, 180, 0)
 
+st.subheader("System sizing (optional)")
+scol1, scol2, scol3 = st.columns(3)
+with scol1:
+    use_panels = st.checkbox("Calculate kWp from panels", value=False)
+with scol2:
+    n_panels = st.number_input("Number of panels", value=10, min_value=1, step=1, disabled=not use_panels)
+with scol3:
+    panel_wp = st.number_input("Panel power (Wp)", value=550, min_value=100, step=5, disabled=not use_panels)
+
+if use_panels:
+    peakpower = (float(n_panels) * float(panel_wp)) / 1000.0
+    st.info(f"System size auto: **{peakpower:.2f} kWp**")
+else:
+    peakpower = float(peakpower_manual)
+
+st.subheader("Losses")
+preset = st.selectbox("Loss preset", list(LOSS_PRESETS.keys()), index=0)
+if LOSS_PRESETS[preset] is None:
+    loss = st.slider("Total losses (%)", 0, 30, 14)
+else:
+    loss = int(LOSS_PRESETS[preset])
+    st.caption(f"Total losses set to **{loss}%** from preset.")
+
 st.divider()
 
 st.subheader("Economics")
 e1, e2, e3 = st.columns(3)
+
 with e1:
     price_per_kwh = st.number_input("Energy price (€/kWh)", value=0.12, min_value=0.01, step=0.01)
+    self_consumption = st.slider(
+        "Self-consumption (%)",
+        0, 100, 70,
+        help="Sa % e energjise PV konsumohet direkt ne objekt."
+    )
+    export_price = st.number_input(
+        "Export price (€/kWh)",
+        value=0.04, min_value=0.0, step=0.01,
+        help="Cmimi per energjine e shitur ne rrjet (nese aplikohet)."
+    )
+
 with e2:
     capex = st.number_input("CAPEX (system cost €)", value=4500.0, min_value=0.0, step=100.0)
+
 with e3:
     opex_percent = st.number_input("OPEX (% of CAPEX / year)", value=1.0, min_value=0.0, step=0.5)
 
@@ -305,15 +343,13 @@ colA, colB = st.columns(2)
 calc = colA.button("Calculate", use_container_width=True)
 gen_pdf = colB.button("Generate PDF report", use_container_width=True)
 
-
-# State
+# State init
 if "df_monthly" not in st.session_state:
     st.session_state.df_monthly = None
 if "summary" not in st.session_state:
     st.session_state.summary = None
 if "df_cashflow" not in st.session_state:
     st.session_state.df_cashflow = None
-
 
 if calc:
     try:
@@ -325,13 +361,16 @@ if calc:
         annual_kwh = float(df_monthly["Energy_kWh"].sum())
         specific_yield = annual_kwh / float(peakpower)
 
-        gross_y1 = annual_kwh * float(price_per_kwh)
+        sc = float(self_consumption) / 100.0
+        effective_price = sc * float(price_per_kwh) + (1 - sc) * float(export_price)
+
+        gross_y1 = annual_kwh * effective_price
         opex_y1 = float(capex) * (float(opex_percent) / 100.0)
         net_y1 = gross_y1 - opex_y1
 
         df_cashflow, payback_years, roi = compute_financials(
             annual_kwh=annual_kwh,
-            price_per_kwh=price_per_kwh,
+            price_per_kwh=effective_price,  # use effective blended price
             capex=capex,
             opex_percent=opex_percent,
             lifetime_years=lifetime_years,
@@ -355,7 +394,6 @@ if calc:
     except Exception as e:
         st.error("Gabim gjate llogaritjes.")
         st.exception(e)
-
 
 df_monthly = st.session_state.df_monthly
 summary = st.session_state.summary
@@ -422,11 +460,14 @@ if df_monthly is not None and summary is not None and df_cashflow is not None:
             "tilt": float(tilt),
             "azimuth": float(azimuth),
             "price_per_kwh": float(price_per_kwh),
+            "export_price": float(export_price),
+            "self_consumption": float(self_consumption),
             "capex": float(capex),
             "opex_percent": float(opex_percent),
             "lifetime_years": int(lifetime_years),
             "degradation_percent": float(degradation_percent),
         }
+
         pdf_bytes = make_pdf_report(params, df_monthly, summary, df_cashflow)
 
         st.download_button(
