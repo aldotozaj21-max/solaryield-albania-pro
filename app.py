@@ -27,12 +27,12 @@ st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="centered")
 
 
 # -------------------- HEADER --------------------
-if LOGO_PATH.is_file():
+if LOGO_PATH.exists():
     try:
-        img = Image.open(LOGO_PATH)
+        logo_bytes = LOGO_PATH.read_bytes()
         col1, col2 = st.columns([1, 3])
         with col1:
-            st.image(img, width=120)
+            st.image(logo_bytes, width=120)
         with col2:
             st.title(APP_NAME)
             st.caption(f"Version {APP_VERSION} | Developed by {AUTHOR}")
