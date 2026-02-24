@@ -7,12 +7,13 @@ from pathlib import Path
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
+from PIL import Image
 
 
 # -------------------- App Config --------------------
 APP_NAME = "SolarYield Albania PRO"
 APP_VERSION = "v1.0.0"
-AUTHOR = "Aldo Tozaj"  # ndrysho nëse do
+AUTHOR = "Aldo Tozaj"
 COPYRIGHT = "© 2026 SolarYield Albania PRO. All rights reserved."
 
 BASE_DIR = Path(__file__).parent
@@ -23,11 +24,9 @@ EXPORTS_DIR.mkdir(exist_ok=True)
 LOGO_PATH = ASSETS_DIR / "logo.png"  # opsionale
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", layout="centered")
+
+
 # -------------------- HEADER --------------------
-from PIL import Image
-
-# ...
-
 if LOGO_PATH.is_file():
     try:
         img = Image.open(LOGO_PATH)
@@ -44,6 +43,8 @@ if LOGO_PATH.is_file():
 else:
     st.title(APP_NAME)
     st.caption(f"Version {APP_VERSION} | Developed by {AUTHOR}")
+
+
 # -------------------- Helpers --------------------
 CITY_DB = {
     "Tirana": (41.3275, 19.8187),
@@ -57,20 +58,64 @@ CITY_DB = {
 }
 
 
+@st.cache_data(show_spinner=False, ttl=60 * 60)  # 1 hour cache
 def pvgis_monthly(lat, lon, peakpower, loss, tilt, azimuth):
     url = "https://re.jrc.ec.europa.eu/api/v5_2/PVcalc"
     params = {
-        "lat": lat,
-        "lon": lon,
-        "peakpower": peakpower,
-        "loss": loss,
-        "angle": tilt,
-        "aspect": azimuth,
+        "lat": float(lat),
+        "lon": float(lon),
+        "peakpower": float(peakpower),
+        "loss": float(loss),
+        "angle": float(tilt),
+        "aspect": float(azimuth),
         "outputformat": "json",
     }
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
     return r.json()
+
+
+def extract_monthly_table(pvgis_json: dict) -> pd.DataFrame:
+    """
+    PVGIS outputs['monthly'] sometimes is:
+      - list of dicts (most common)
+      - or dict containing 'fixed' / other keys
+    We handle both.
+    """
+    outputs = pvgis_json.get("outputs", {})
+    monthly = outputs.get("monthly")
+
+    if monthly is None:
+        raise ValueError("PVGIS JSON missing outputs.monthly")
+
+    if isinstance(monthly, list):
+        df = pd.DataFrame(monthly)
+    elif isinstance(monthly, dict):
+        # try common keys
+        if "fixed" in monthly:
+            df = pd.DataFrame(monthly["fixed"])
+        else:
+            # fallback: first list-like value inside dict
+            list_candidate = None
+            for v in monthly.values():
+                if isinstance(v, list):
+                    list_candidate = v
+                    break
+            if list_candidate is None:
+                raise ValueError(f"PVGIS outputs.monthly has unexpected format: keys={list(monthly.keys())}")
+            df = pd.DataFrame(list_candidate)
+    else:
+        raise ValueError(f"PVGIS outputs.monthly type unexpected: {type(monthly)}")
+
+    # Expect E_m (kWh) and month
+    if "month" not in df.columns:
+        raise ValueError(f"PVGIS monthly table missing 'month'. Columns: {list(df.columns)}")
+    if "E_m" not in df.columns:
+        raise ValueError(f"PVGIS monthly table missing 'E_m'. Columns: {list(df.columns)}")
+
+    df["month"] = df["month"].astype(int)
+    df["Energy_kWh"] = df["E_m"].astype(float)
+    return df[["month", "Energy_kWh"]]
 
 
 def compute_financials(annual_kwh, price_per_kwh, capex, opex_percent, lifetime_years, degradation_percent):
@@ -104,14 +149,12 @@ def compute_financials(annual_kwh, price_per_kwh, capex, opex_percent, lifetime_
 
     df = pd.DataFrame(rows)
 
-    # Simple payback: viti i parë kur cumulative >= 0
     payback = None
     hit = df[df["Cumulative_EUR"] >= 0]
     if len(hit) > 0:
         payback = int(hit.iloc[0]["Year"])
 
     roi = (df["NetCashflow_EUR"].sum() - capex) / capex if capex > 0 else None
-
     return df, payback, roi
 
 
@@ -120,12 +163,9 @@ def make_pdf_report(params: dict, df_monthly: pd.DataFrame, summary: dict, df_ca
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
 
-    # Header area
     y = height - 50
 
-    # Logo (opsionale)
     if LOGO_PATH.exists():
-        # (x, y, width, height)
         c.drawImage(str(LOGO_PATH), 50, y - 35, width=80, height=30, mask='auto')
         c.setFont("Helvetica-Bold", 18)
         c.drawString(140, y - 10, f"{APP_NAME} — Report")
@@ -140,7 +180,6 @@ def make_pdf_report(params: dict, df_monthly: pd.DataFrame, summary: dict, df_ca
     c.drawString(50, y, "PV yield estimate using PVGIS data + financial analysis.")
     y -= 22
 
-    # Inputs
     c.setFont("Helvetica-Bold", 12)
     c.drawString(50, y, "Inputs")
     y -= 14
@@ -158,8 +197,6 @@ def make_pdf_report(params: dict, df_monthly: pd.DataFrame, summary: dict, df_ca
         y -= 14
 
     y -= 8
-
-    # Results summary
     c.setFont("Helvetica-Bold", 12)
     c.drawString(50, y, "Results")
     y -= 14
@@ -180,8 +217,6 @@ def make_pdf_report(params: dict, df_monthly: pd.DataFrame, summary: dict, df_ca
         y -= 14
 
     y -= 6
-
-    # Monthly table
     c.setFont("Helvetica-Bold", 12)
     c.drawString(50, y, "Monthly energy (kWh)")
     y -= 16
@@ -200,7 +235,6 @@ def make_pdf_report(params: dict, df_monthly: pd.DataFrame, summary: dict, df_ca
             y = height - 60
             c.setFont("Helvetica", 10)
 
-    # Cashflow short table (first 10 years)
     c.showPage()
     y = height - 60
     c.setFont("Helvetica-Bold", 12)
@@ -271,6 +305,7 @@ colA, colB = st.columns(2)
 calc = colA.button("Calculate", use_container_width=True)
 gen_pdf = colB.button("Generate PDF report", use_container_width=True)
 
+
 # State
 if "df_monthly" not in st.session_state:
     st.session_state.df_monthly = None
@@ -279,21 +314,15 @@ if "summary" not in st.session_state:
 if "df_cashflow" not in st.session_state:
     st.session_state.df_cashflow = None
 
+
 if calc:
     try:
-        data = pvgis_monthly(lat, lon, peakpower, loss, tilt, azimuth)
-        monthly = data["outputs"]["monthly"]["fixed"]
-        df = pd.DataFrame(monthly)
+        with st.spinner("Calling PVGIS..."):
+            data = pvgis_monthly(lat, lon, peakpower, loss, tilt, azimuth)
 
-        if "E_m" not in df.columns:
-            st.error(f"Nuk u gjet 'E_m' te përgjigja PVGIS. Kolonat: {list(df.columns)}")
-            st.json(data)
-            st.stop()
+        df_monthly = extract_monthly_table(data)
 
-        df["month"] = df["month"].astype(int)
-        df["Energy_kWh"] = df["E_m"].astype(float)
-
-        annual_kwh = float(df["Energy_kWh"].sum())
+        annual_kwh = float(df_monthly["Energy_kWh"].sum())
         specific_yield = annual_kwh / float(peakpower)
 
         gross_y1 = annual_kwh * float(price_per_kwh)
@@ -319,12 +348,14 @@ if calc:
             "roi": roi,
         }
 
-        st.session_state.df_monthly = df
+        st.session_state.df_monthly = df_monthly
         st.session_state.summary = summary
         st.session_state.df_cashflow = df_cashflow
 
     except Exception as e:
-        st.error(f"Gabim: {e}")
+        st.error("Gabim gjate llogaritjes.")
+        st.exception(e)
+
 
 df_monthly = st.session_state.df_monthly
 summary = st.session_state.summary
@@ -344,24 +375,26 @@ if df_monthly is not None and summary is not None and df_cashflow is not None:
     s3.metric("Net savings (Year 1) €/yr", f"{summary['net_savings_y1']:,.0f}")
 
     st.write("Monthly energy:")
-    st.dataframe(df_monthly[["month", "Energy_kWh"]], use_container_width=True)
+    st.dataframe(df_monthly, use_container_width=True)
 
-    fig1 = plt.figure()
-    plt.plot(df_monthly["month"], df_monthly["Energy_kWh"], marker="o")
-    plt.xlabel("Month")
-    plt.ylabel("Energy (kWh)")
-    plt.grid(True)
+    fig1, ax1 = plt.subplots()
+    ax1.plot(df_monthly["month"], df_monthly["Energy_kWh"], marker="o")
+    ax1.set_xlabel("Month")
+    ax1.set_ylabel("Energy (kWh)")
+    ax1.grid(True)
     st.pyplot(fig1)
+    plt.close(fig1)
 
-    st.write("Cashflow (25 years):")
+    st.write("Cashflow (lifetime):")
     st.dataframe(df_cashflow, use_container_width=True)
 
-    fig2 = plt.figure()
-    plt.plot(df_cashflow["Year"], df_cashflow["Cumulative_EUR"], marker="o")
-    plt.xlabel("Year")
-    plt.ylabel("Cumulative (€)")
-    plt.grid(True)
+    fig2, ax2 = plt.subplots()
+    ax2.plot(df_cashflow["Year"], df_cashflow["Cumulative_EUR"], marker="o")
+    ax2.set_xlabel("Year")
+    ax2.set_ylabel("Cumulative (€)")
+    ax2.grid(True)
     st.pyplot(fig2)
+    plt.close(fig2)
 
     # Export Excel
     excel_buf = BytesIO()
@@ -382,17 +415,17 @@ if df_monthly is not None and summary is not None and df_cashflow is not None:
     if gen_pdf:
         params = {
             "city": city,
-            "lat": lat,
-            "lon": lon,
-            "peakpower": peakpower,
-            "loss": loss,
-            "tilt": tilt,
-            "azimuth": azimuth,
-            "price_per_kwh": price_per_kwh,
-            "capex": capex,
-            "opex_percent": opex_percent,
-            "lifetime_years": lifetime_years,
-            "degradation_percent": degradation_percent,
+            "lat": float(lat),
+            "lon": float(lon),
+            "peakpower": float(peakpower),
+            "loss": float(loss),
+            "tilt": float(tilt),
+            "azimuth": float(azimuth),
+            "price_per_kwh": float(price_per_kwh),
+            "capex": float(capex),
+            "opex_percent": float(opex_percent),
+            "lifetime_years": int(lifetime_years),
+            "degradation_percent": float(degradation_percent),
         }
         pdf_bytes = make_pdf_report(params, df_monthly, summary, df_cashflow)
 
@@ -405,17 +438,15 @@ if df_monthly is not None and summary is not None and df_cashflow is not None:
         )
 else:
     st.info("Kliko **Calculate** për të gjeneruar rezultatet.")
-    # -------------------- FOOTER --------------------
 
+
+# -------------------- FOOTER --------------------
 st.divider()
-
 st.markdown(
     f"""
     <div style='text-align: center; font-size: 14px; opacity: 0.7;'>
-
-    © 2026 {AUTHOR} — {APP_NAME} {APP_VERSION}  
-    Professional PV Yield & Financial Analysis Tool  
-
+    © 2026 {AUTHOR} — {APP_NAME} {APP_VERSION}<br>
+    Professional PV Yield & Financial Analysis Tool
     </div>
     """,
     unsafe_allow_html=True

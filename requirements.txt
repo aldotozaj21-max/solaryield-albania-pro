@@ -2,5 +2,6 @@ streamlit
 pandas
 matplotlib
 requests
-openpyxl
+pillow
 reportlab
+openpyxl
